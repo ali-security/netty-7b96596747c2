@@ -1,0 +1,135 @@
+name: seal-build
+
+# Upstream Netty 4.1.45.Final ships no GitHub Actions CI. This workflow mirrors the
+# release build of netty-transport-native-kqueue: the native kqueue transport only
+# compiles (and its tests only run) on macOS, and the public jars were built with
+# JDK 1.8.0_232 + Maven 3.6.3 (the repo's mvnw pin) on an x86_64 Mac.
+on:
+  workflow_dispatch:
+    inputs:
+      test-filter:
+        description: "Optional surefire -Dtest selector; empty runs the full suite"
+        required: false
+        default: ""
+
+env:
+  MAVEN_OPTS: -Xmx2g
+  SKIP_GATES: >-
+    -Dcheckstyle.skip=true -Dforbiddenapis.skip=true -Danimal.sniffer.skip=true
+    -Djapicmp.skip=true -DskipJapicmp=true -Drevapi.skip=true -Dxml.skip=true
+    -Dmaven.javadoc.skip=true -Dmaven.source.skip=true -Dgpg.skip=true
+
+jobs:
+  build-macos-x86_64:
+    runs-on: macos-15-intel
+    timeout-minutes: 50
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up JDK 8u232
+        uses: actions/setup-java@v4
+        with:
+          distribution: zulu
+          java-version: "8.0.232"
+          architecture: x64
+
+      - name: Install native toolchain (hawtjni autogen)
+        run: brew install autoconf automake libtool
+
+      # The tests use netty-tcnative 2.0.28.Final (osx-x86_64), whose jnilib links
+      # /usr/local/opt/openssl/lib/lib{ssl,crypto}.1.0.0.dylib and
+      # /usr/local/opt/apr/libexec/lib/libapr-1.0.dylib (Homebrew paths of the
+      # release era). Homebrew no longer ships OpenSSL 1.0, so build it into that path;
+      # without it the OpenSSL-parameterised SSL tests drop out.
+      - name: Provide OpenSSL 1.0.2 + APR for netty-tcnative
+        run: |
+          brew install apr
+          # Current Homebrew apr keeps the dylib in lib/, the release-era keg had libexec/lib/.
+          ls -l /usr/local/opt/apr/lib/
+          mkdir -p /usr/local/opt/apr/libexec/lib
+          ln -sf /usr/local/opt/apr/lib/libapr-1.0.dylib /usr/local/opt/apr/libexec/lib/libapr-1.0.dylib
+          ls -lL /usr/local/opt/apr/libexec/lib/libapr-1.0.dylib
+          cd "$RUNNER_TEMP"
+          curl -fsSLO https://github.com/openssl/openssl/releases/download/OpenSSL_1_0_2u/openssl-1.0.2u.tar.gz
+          tar xzf openssl-1.0.2u.tar.gz
+          cd openssl-1.0.2u
+          ./Configure darwin64-x86_64-cc shared no-ssl2 \
+            --prefix=/usr/local/opt/openssl-1.0.2u --openssldir=/usr/local/opt/openssl-1.0.2u/ssl > build.log 2>&1
+          if ! { make depend && make && make install_sw; } >> build.log 2>&1; then tail -80 build.log; exit 1; fi
+          sudo rm -rf /usr/local/opt/openssl
+          sudo ln -s /usr/local/opt/openssl-1.0.2u /usr/local/opt/openssl
+          ls -l /usr/local/opt/openssl/lib/libssl.1.0.0.dylib /usr/local/opt/openssl/lib/libcrypto.1.0.0.dylib
+          /usr/local/opt/openssl/bin/openssl version
+
+      - name: Build and install (kqueue + reactor dependencies)
+        run: |
+          ./mvnw -B -ntp -e clean install \
+            -pl dev-tools,transport-native-kqueue -am \
+            -DskipTests $SKIP_GATES
+
+      - name: Test
+        timeout-minutes: 30
+        run: |
+          # Hang diagnostics: the suite normally finishes in ~6 min; if it is still
+          # running after 15 min, print thread dumps of every JVM so the stuck test is named.
+          ( sleep 900; while true; do
+              for p in $(jps -q); do echo "=== jstack $p"; jstack "$p"; done
+              sleep 300
+            done ) &
+          if [ -n "${{ inputs.test-filter }}" ]; then
+            ./mvnw -B -ntp -e test -pl transport-native-kqueue \
+              -Dtest=${{ inputs.test-filter }} -DfailIfNoTests=false $SKIP_GATES
+          else
+            # install (not test): kqueue unpacks the reactor's unix-common native
+            # jar in generate-sources, which needs it packaged first (MDEP-98).
+            # rerunFailingTestsCount: the socket testsuite is timing-sensitive on hosted
+            # macOS runners and surefire runs it in random order (runOrder=random).
+            ./mvnw -B -ntp -e install \
+              -pl transport-native-unix-common,transport-native-unix-common-tests,transport-native-kqueue \
+              -Dsurefire.rerunFailingTestsCount=2 -Dsurefire.timeout=1500 $SKIP_GATES
+          fi
+
+      - name: List skipped tests with reasons
+        if: always()
+        run: |
+          # Print every skipped test with its surefire message and the source of the
+          # test method (in the kqueue test class or its netty-testsuite superclass),
+          # since several assumptions carry their reason only in a source comment.
+          python3 - <<'EOF'
+          import glob
+          import re
+          import xml.etree.ElementTree as ET
+          sources = glob.glob('*/src/test/java/**/*.java', recursive=True) + \
+              glob.glob('testsuite/src/main/java/**/*.java', recursive=True)
+          seen = set()
+          for report in sorted(glob.glob('transport-native-*/target/surefire-reports/TEST-*.xml')):
+              for tc in ET.parse(report).getroot().iter('testcase'):
+                  skipped = tc.find('skipped')
+                  if skipped is None:
+                      continue
+                  cls = tc.get('classname')
+                  name = re.sub(r'\[.*$', '', tc.get('name'))
+                  print('SKIPPED %s#%s: %s' % (cls, tc.get('name'), skipped.get('message')))
+                  if (cls, name) in seen:
+                      continue
+                  seen.add((cls, name))
+                  for src in sources:
+                      lines = open(src).read().splitlines()
+                      for i, line in enumerate(lines):
+                          if re.search(r'public void %s\(\)' % re.escape(name), line) or \
+                                  re.search(r'public void %s\(ServerBootstrap|public void %s\(Bootstrap'
+                                            % (re.escape(name), re.escape(name)), line):
+                              print('  reason in source %s:%d' % (src, i + 1))
+                              for l in lines[i:i + 7]:
+                                  print('    ' + l)
+          EOF
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: netty-transport-native-kqueue-4.1.45.Final
+          if-no-files-found: error
+          path: |
+            transport-native-kqueue/target/netty-transport-native-kqueue-4.1.45.Final.jar
+            transport-native-kqueue/target/netty-transport-native-kqueue-4.1.45.Final-osx-x86_64.jar
+            transport-native-kqueue/target/netty-transport-native-kqueue-4.1.45.Final-tests.jar
